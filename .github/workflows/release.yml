@@ -1,0 +1,83 @@
+name: Release
+
+# Creates the GitHub Release for a published tag.
+#
+# The tag itself is pushed by the upstream pipeline, which authenticates with a
+# deploy key. A deploy key grants git access but no API access, and a Release is
+# an API object -- so the tag arrives without one. This fills that gap using the
+# built-in workflow token, so no additional secret has to be issued or rotated.
+#
+# Notes are the matching section of CHANGELOG.md, so the Release and the
+# changelog cannot drift.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  # For a tag that was pushed before this workflow existed, or to refresh notes
+  # after editing CHANGELOG.md.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to create or refresh a release for (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Inputs reach the shell through the environment, never through direct
+      # ${{ }} interpolation into a script body.
+      - name: Resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$TAG' is not a vX.Y.Z tag"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          # Stop at the next version heading or at the link-reference block, so
+          # the oldest section does not swallow the tail of the file.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\] - " {f=1; next}
+            f && (/^## \[/ || /^\[[^]]*\]: /) {exit}
+            f {print}
+          ' CHANGELOG.md | sed -e '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION] - YYYY-MM-DD' section"
+            exit 1
+          fi
+          echo "notes: $(wc -l < notes.md | tr -d ' ') lines"
+
+      - name: Create or refresh the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md
+            echo "refreshed release $TAG"
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+            echo "created release $TAG"
+          fi

@@ -1,0 +1,9 @@
+/tmp
+.DS_Store
+.env
+.*.env
+!.example.env
+.idea
+*/settings.json
+go.work
+go.work.sum
