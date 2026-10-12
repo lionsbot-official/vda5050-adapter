@@ -181,7 +181,9 @@ func TestExecutor_CancelMidClean_LateEventIgnored(t *testing.T) {
 	<-cmd.cleanStarts
 	waitActionStatus(t, store, "a1", state.ActionStatusRunning)
 
-	e.InstantAction(order.Action{ActionID: "ia-cancel", ActionType: "cancelOrder"})
+	cancel := order.Action{ActionID: "ia-cancel", ActionType: "cancelOrder"}
+	acceptInstant(store, cancel)
+	e.InstantAction(cancel)
 
 	// spec 6.1.3 (:477): a running clean must be cancelled on the robot, not
 	// just dropped locally — route the stop by op kind (clean_stop, not p2p_stop)
@@ -191,6 +193,11 @@ func TestExecutor_CancelMidClean_LateEventIgnored(t *testing.T) {
 		t.Fatal("cancelOrder mid-clean did not send clean_stop")
 	}
 
+	if vehiclestate.IsIdle(store.Snapshot()) {
+		t.Fatal("order became idle before robot completion")
+	}
+	waitActionStatus(t, store, "a1", state.ActionStatusRunning)
+	cmd.events <- robotbus.ExecutionEvent{CleanCompleted: &robotbus.CleanCompleted{Success: true}}
 	waitActionStatus(t, store, "a1", state.ActionStatusFailed)
 	if !vehiclestate.IsIdle(store.Snapshot()) {
 		t.Fatal("vehicle not idle after cancel")
@@ -256,6 +263,7 @@ func TestExecutor_PauseResumeMidClean_RoutesByOpKind(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	waitPaused(t, store, true)
+	waitActionStatus(t, store, "a1", state.ActionStatusPaused)
 	waitInstantStatus(t, store, "cp1", state.ActionStatusFinished)
 
 	// stopPause: clean_continue carrying the original bypassBlackout (true here)
@@ -276,6 +284,7 @@ func TestExecutor_PauseResumeMidClean_RoutesByOpKind(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	waitPaused(t, store, false)
+	waitActionStatus(t, store, "a1", state.ActionStatusRunning)
 	waitInstantStatus(t, store, "cp2", state.ActionStatusFinished)
 }
 

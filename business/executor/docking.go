@@ -26,6 +26,7 @@ func (e *Executor) startDocking(a order.Action, docking **order.Action) {
 		e.store.SetActionStatus(a.ActionID, state.ActionStatusFailed, "dock dispatch failed: "+err.Error())
 		return
 	}
+	e.operationMap = e.currentMap()
 	e.store.SetActionStatus(a.ActionID, state.ActionStatusRunning, "")
 	ac := a
 	*docking = &ac

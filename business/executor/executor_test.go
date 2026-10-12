@@ -274,12 +274,12 @@ func TestExecutor_TraversesMultiNodeBaseInSequence(t *testing.T) {
 	startExecutor(t, e)
 
 	o := order.Order{
-		OrderID: "o-multi",
+		OrderID: "o1",
 		Nodes: []order.Node{
 			{NodeID: "n0", SequenceID: 0, Released: true},
-			{NodeID: "n1", SequenceID: 2, Released: true, NodePosition: &order.NodePosition{X: 1, Y: 0, MapID: "m", Theta: floatPtr(0)}},
-			{NodeID: "n2", SequenceID: 4, Released: true, NodePosition: &order.NodePosition{X: 2, Y: 0, MapID: "m", Theta: floatPtr(0)}},
-			{NodeID: "n3", SequenceID: 6, Released: false, NodePosition: &order.NodePosition{X: 3, Y: 0, MapID: "m", Theta: floatPtr(0)}},
+			{NodeID: "n1", SequenceID: 2, Released: true, NodePosition: &order.NodePosition{X: 1, Y: 0, MapID: "map-1", Theta: floatPtr(0)}},
+			{NodeID: "n2", SequenceID: 4, Released: true, NodePosition: &order.NodePosition{X: 2, Y: 0, MapID: "map-1", Theta: floatPtr(0)}},
+			{NodeID: "n3", SequenceID: 6, Released: false, NodePosition: &order.NodePosition{X: 3, Y: 0, MapID: "map-1", Theta: floatPtr(0)}},
 		},
 	}
 	e.OrderAccepted(o)
@@ -298,7 +298,7 @@ func TestExecutor_TraversesMultiNodeBaseInSequence(t *testing.T) {
 		t.Fatalf("second node dispatched while first in flight: %+v", m)
 	case <-time.After(50 * time.Millisecond):
 	}
-	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 1, Y: 0, MapID: "m", Localized: true}})
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 1, Y: 0, MapID: "map-1", Localized: true}})
 	cmd.events <- robotbus.ExecutionEvent{MoveCompleted: &robotbus.MoveCompleted{Success: true}}
 	waitLastNode(t, store, "n1")
 
@@ -311,7 +311,7 @@ func TestExecutor_TraversesMultiNodeBaseInSequence(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no second dispatch")
 	}
-	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 2, Y: 0, MapID: "m", Localized: true}})
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 2, Y: 0, MapID: "map-1", Localized: true}})
 	cmd.events <- robotbus.ExecutionEvent{MoveCompleted: &robotbus.MoveCompleted{Success: true}}
 	waitLastNode(t, store, "n2")
 
@@ -341,7 +341,7 @@ func TestExecutor_UpdateMidMoveStopsFirst(t *testing.T) {
 	update := singleTargetOrder()
 	update.OrderUpdateID = 1
 	update.Nodes[1] = order.Node{NodeID: "n9", SequenceID: 2, Released: true,
-		NodePosition: &order.NodePosition{X: 7, Y: 8, MapID: "m", Theta: floatPtr(0)}}
+		NodePosition: &order.NodePosition{X: 7, Y: 8, MapID: "map-1", Theta: floatPtr(0)}}
 	e.OrderAccepted(update)
 
 	select {
@@ -440,11 +440,11 @@ func TestExecutor_SettlesBeforeNextMove(t *testing.T) {
 	startExecutor(t, e)
 
 	o := order.Order{
-		OrderID: "o-settle",
+		OrderID: "o1",
 		Nodes: []order.Node{
 			{NodeID: "n0", SequenceID: 0, Released: true},
-			{NodeID: "n1", SequenceID: 2, Released: true, NodePosition: &order.NodePosition{X: 1, Y: 0, MapID: "m", Theta: floatPtr(0)}},
-			{NodeID: "n2", SequenceID: 4, Released: true, NodePosition: &order.NodePosition{X: 2, Y: 0, MapID: "m", Theta: floatPtr(0)}},
+			{NodeID: "n1", SequenceID: 2, Released: true, NodePosition: &order.NodePosition{X: 1, Y: 0, MapID: "map-1", Theta: floatPtr(0)}},
+			{NodeID: "n2", SequenceID: 4, Released: true, NodePosition: &order.NodePosition{X: 2, Y: 0, MapID: "map-1", Theta: floatPtr(0)}},
 		},
 	}
 	e.OrderAccepted(o)
@@ -459,7 +459,7 @@ func TestExecutor_SettlesBeforeNextMove(t *testing.T) {
 		t.Fatal("no first dispatch")
 	}
 
-	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 1, Y: 0, MapID: "m", Localized: true}})
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{X: 1, Y: 0, MapID: "map-1", Localized: true}})
 	cmd.events <- robotbus.ExecutionEvent{MoveCompleted: &robotbus.MoveCompleted{Success: true}}
 	waitLastNode(t, store, "n1")
 
@@ -485,7 +485,7 @@ func TestExecutor_ThetaAbsentUsesCurrentHeading(t *testing.T) {
 	store := vehiclestate.New()
 	seedStore(store, 0, 0)
 	store.SetTelemetry(vehiclestate.Telemetry{
-		MobileRobotPosition: &state.MobileRobotPosition{X: 0, Y: 0, Theta: 0.7, MapID: "m", Localized: true},
+		MobileRobotPosition: &state.MobileRobotPosition{X: 0, Y: 0, Theta: 0.7, MapID: "map-1", Localized: true},
 	})
 	cmd := newFakeCommander()
 	e := New(store, cmd)
@@ -621,6 +621,15 @@ func TestExecutor_StopWriteErrorHaltsWithError(t *testing.T) {
 	case m := <-cmd.moves:
 		t.Fatalf("dispatched after stop failure: %+v", m)
 	case <-time.After(100 * time.Millisecond):
+	}
+	charge := order.Action{ActionID: "after-failed-stop", ActionType: "startCharging"}
+	acceptInstant(store, charge)
+	e.InstantAction(charge)
+	waitInstantStatus(t, store, charge.ActionID, state.ActionStatusFailed)
+	select {
+	case <-cmd.chargeStarts:
+		t.Fatal("lost running move tracking after failed replan stop")
+	default:
 	}
 }
 

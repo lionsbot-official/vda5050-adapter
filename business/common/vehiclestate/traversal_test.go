@@ -324,3 +324,19 @@ func TestSetPaused(t *testing.T) {
 		t.Fatal("Paused, want explicit false after resume")
 	}
 }
+
+func TestBeginCancellationFailsScheduledActionsAndKeepsRunningState(t *testing.T) {
+	s := New()
+	s.CommitOrderProjection(OrderProjection{
+		OrderID: "o1", NodeStates: []state.NodeState{{NodeID: "n1", SequenceID: 2}},
+		ActionStates: []state.ActionState{
+			{ActionID: "waiting", ActionStatus: state.ActionStatusWaiting},
+			{ActionID: "running", ActionStatus: state.ActionStatusRunning},
+		},
+	})
+	s.BeginOrderCancellation()
+	got := s.Snapshot()
+	if !s.OrderCancelled() || IsIdle(got) || len(got.NodeStates) != 1 || got.ActionStates[0].ActionStatus != state.ActionStatusFailed || got.ActionStates[1].ActionStatus != state.ActionStatusRunning {
+		t.Fatalf("cancellation lost running state or retained scheduled action: %+v", got)
+	}
+}

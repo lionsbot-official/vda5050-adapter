@@ -11,7 +11,8 @@ import (
 
 func setCharging(s *vehiclestate.Store, charging bool) {
 	s.SetTelemetry(vehiclestate.Telemetry{
-		PowerSupply: &state.PowerSupply{StateOfCharge: 80, Charging: charging},
+		PowerSupply:         &state.PowerSupply{StateOfCharge: 80, Charging: charging},
+		MobileRobotPosition: s.Snapshot().MobileRobotPosition,
 	})
 }
 

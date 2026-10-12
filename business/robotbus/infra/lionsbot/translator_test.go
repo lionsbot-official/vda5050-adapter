@@ -115,8 +115,8 @@ func TestTranslate_OperatingMode(t *testing.T) {
 	}{
 		{"Estop -> MANUAL", codeV1, 98, true, state.OperatingModeManual},
 		{"Estop beats not-localized -> MANUAL", codeV1, 98, false, state.OperatingModeManual},
-		{"Moving not localized -> SERVICE", codeV1, 2, false, state.OperatingModeService},
-		{"Teleop not localized -> SERVICE (rule 2 before 3)", codeV1, 6, false, state.OperatingModeService},
+		{"Localization loss keeps AUTOMATIC", codeV1, 2, false, state.OperatingModeAutomatic},
+		{"Teleop remains MANUAL without localization", codeV1, 6, false, state.OperatingModeManual},
 		{"Teleoping localized -> MANUAL", codeV1, 6, true, state.OperatingModeManual},
 		{"ManualDock -> MANUAL", codeV2, 18, true, state.OperatingModeManual},
 		{"Mapping -> SERVICE", codeV1, 9, true, state.OperatingModeService},

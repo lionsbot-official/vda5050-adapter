@@ -106,7 +106,7 @@ func (tr *translator) snapshot() vehiclestate.Telemetry {
 			if canonical, ok := decodeState(tr.version, *s.Content.State); ok {
 				driving := drivingStates[canonical]
 				t.Driving = &driving
-				mode := operatingMode(canonical, s.Content.Localized)
+				mode := operatingMode(canonical)
 				t.OperatingMode = &mode
 				safety := safetyState(canonical)
 				t.SafetyState = &safety
@@ -199,12 +199,10 @@ func boolStr(b bool) string {
 	return "false"
 }
 
-func operatingMode(s canonicalState, localized bool) state.OperatingMode {
+func operatingMode(s canonicalState) state.OperatingMode {
 	switch {
 	case s == stateEstop:
 		return state.OperatingModeManual
-	case !localized:
-		return state.OperatingModeService
 	case s == stateTeleop || s == stateTeleopClean || s == stateManualDock:
 		return state.OperatingModeManual
 	case s == stateMapping || s == stateExpandMap || s == stateExplore ||

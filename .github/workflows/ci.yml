@@ -4,7 +4,7 @@ name: CI
 # builds and passes its own suite standalone.
 on:
   push:
-    branches: [main]
+    branches: [main, vda-2.1.0, vda-2.0.0]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

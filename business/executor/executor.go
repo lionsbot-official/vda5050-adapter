@@ -25,14 +25,15 @@ const defaultDeviationXY = 0.5 // metres
 const settleAfterMove = 1500 * time.Millisecond
 
 type Executor struct {
-	store       *vehiclestate.Store
-	cmd         robotbus.RobotCommander
-	orders      chan order.Order
-	instants    chan order.Action
-	orderID     string        // current order, for error references (sequencer goroutine only)
-	paused      bool          // pause mode; nothing dispatches while set (sequencer goroutine only)
-	settling    bool          // settle gap after a move; nothing dispatches while set
-	settleDelay time.Duration // gap before dispatching the node after a completed move; 0 in tests
+	store        *vehiclestate.Store
+	cmd          robotbus.RobotCommander
+	orders       chan order.Order
+	instants     chan order.Action
+	operationMap string
+	orderID      string        // current order, for error references (sequencer goroutine only)
+	paused       bool          // pause mode; nothing dispatches while set (sequencer goroutine only)
+	settling     bool          // settle gap after a move; nothing dispatches while set
+	settleDelay  time.Duration // gap before dispatching the node after a completed move; 0 in tests
 }
 
 func New(store *vehiclestate.Store, cmd robotbus.RobotCommander) *Executor {
@@ -72,35 +73,124 @@ func (e *Executor) Start(ctx context.Context) error {
 	var reloc *order.Action      // in-flight initializePosition instant action
 	var cleaning *order.Action   // in-flight startCleaning node action
 	var docking *order.Action    // in-flight startCharging/stopCharging node action
+	var pausing *order.Action    // pause activation awaits a noninterruptible auto-undock
 	var cancelling *order.Action // cancelOrder awaiting the interrupted move's end event
+	interruptedAction := false   // a stopped clean/dock awaits its matching end event
 	stopping := false            // a replan interrupted the in-flight move; await its end event
 	undocking := false           // auto-undock in flight; first move held until it completes
 	var settleC <-chan time.Time // fires when the post-move settle gap elapses; then dispatch
 
 	for {
+		if e.store.OrderCleared() {
+			queue, nodeActions = nil, nil
+			settleC = nil
+			e.settling = false
+		}
+		if e.store.ModeChangePending() {
+			if inFlight == nil && cleaning == nil && docking == nil && charge == nil && reloc == nil && !stopping && !undocking && cancelling == nil {
+				if pausing != nil {
+					e.store.SetInstantActionStatus(pausing.ActionID, state.ActionStatusFailed, "operating mode changed")
+					pausing = nil
+				}
+				e.store.CompleteModeTransition()
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-e.store.ReadinessChanges():
+			if cancelling == nil && !interruptedAction {
+				if inFlight != nil && !e.readyToDrive(inFlight.NodePosition.MapID) {
+					if err := e.cmd.StopMovement(); err != nil {
+						e.reportUnreachable(*inFlight, "safety stop dispatch failed: "+err.Error())
+						continue
+					}
+					queue = append([]order.Node{*inFlight}, queue...)
+					inFlight = nil
+					stopping = true
+				} else if !e.readyToDrive(e.operationMap) {
+					var err error
+					switch {
+					case cleaning != nil:
+						err = e.cmd.StopCleaning()
+						if err != nil {
+							e.store.SetActionStatus(cleaning.ActionID, state.ActionStatusRunning, "safety stop dispatch failed: "+err.Error())
+						}
+						interruptedAction = err == nil
+					case docking != nil && docking.ActionType == "startCharging":
+						err = e.cmd.AbortDocking()
+						if err != nil {
+							e.store.SetActionStatus(docking.ActionID, state.ActionStatusRunning, "safety stop dispatch failed: "+err.Error())
+						}
+						interruptedAction = err == nil
+					case charge != nil && charge.ActionType == "startCharging":
+						err = e.cmd.AbortDocking()
+						if err != nil {
+							e.store.SetInstantActionStatus(charge.ActionID, state.ActionStatusRunning, "safety stop dispatch failed: "+err.Error())
+						}
+						interruptedAction = err == nil
+					}
+				}
+			}
+			if stopping || undocking || cancelling != nil || interruptedAction {
+				continue
+			}
+			e.beginPlan(&queue, &inFlight, &undocking)
+			e.beginNodeActions(&nodeActions, &cleaning, &docking)
 		case <-settleC:
 			settleC = nil
 			e.settling = false
 			e.dispatchNext(&queue, &inFlight)
 		case a := <-e.instants:
+			pending := false
+			for _, tracked := range e.store.Snapshot().InstantActionStates {
+				if tracked.ActionID == a.ActionID && tracked.ActionStatus == state.ActionStatusWaiting {
+					pending = true
+					break
+				}
+			}
+			if !pending {
+				continue
+			}
 			switch a.ActionType {
 			case "cancelOrder":
-				e.handleCancel(a, &queue, &nodeActions, &inFlight, &cleaning, &docking, &cancelling)
+				e.handleCancel(a, &queue, &nodeActions, &inFlight, &cleaning, &docking, &cancelling, undocking || stopping || interruptedAction)
 			case "startPause":
-				e.handlePause(a, inFlight, cleaning, docking)
+				if undocking {
+					if pausing != nil {
+						e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "pause activation already pending")
+						continue
+					}
+					pausing = &a
+					e.paused = true
+					e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusRunning, "")
+					continue
+				}
+				e.handlePause(a, inFlight, cleaning, docking, charge)
 			case "stopPause":
-				e.handleResume(a, &queue, &inFlight, cleaning, docking)
+				if pausing != nil {
+					e.store.SetInstantActionStatus(pausing.ActionID, state.ActionStatusFailed, "pause activation superseded by stopPause")
+					pausing = nil
+				}
+				if stopping || interruptedAction || cancelling != nil || undocking {
+					e.paused = false
+					e.store.SetPaused(false)
+					e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFinished, "")
+					continue
+				}
+				e.handleResume(a, &queue, &inFlight, &undocking, cleaning, docking, charge)
+				e.beginNodeActions(&nodeActions, &cleaning, &docking)
 			case "initializePosition":
-				busy := inFlight != nil || len(queue) > 0 || stopping || cleaning != nil || docking != nil || charge != nil
+				busy := inFlight != nil || len(queue) > 0 || stopping || undocking || cancelling != nil || len(nodeActions) > 0 || e.paused || cleaning != nil || docking != nil || charge != nil
 				e.handleRelocalize(a, busy, &reloc)
 			default:
-				busy := inFlight != nil || len(queue) > 0 || stopping || cleaning != nil || docking != nil || reloc != nil
+				busy := inFlight != nil || len(queue) > 0 || stopping || undocking || cancelling != nil || len(nodeActions) > 0 || e.paused || cleaning != nil || docking != nil || reloc != nil
 				e.handleInstantAction(a, busy, &charge)
 			}
 		case o := <-e.orders:
+			if e.store.OrderCancelled() || e.store.OrderCleared() || e.store.Snapshot().OrderID != o.OrderID {
+				continue
+			}
 			newQueue := e.plan(o)
 			// An update that only appended nodes beyond the one in flight leaves
 			// the current move valid — keep the robot moving toward it, swap in
@@ -121,18 +211,77 @@ func (e *Executor) Start(ctx context.Context) error {
 					e.reportUnreachable(*inFlight, "stop dispatch failed: "+err.Error())
 					queue = nil // halt until fleet control re-plans
 					nodeActions = nil
-					inFlight = nil
 					continue
 				}
 				inFlight = nil
 				stopping = true
 				continue
 			}
-			e.beginPlan(&queue, &inFlight, &undocking)
-			e.beginNodeActions(&nodeActions, &cleaning, &docking)
+			if !stopping && !interruptedAction {
+				e.beginPlan(&queue, &inFlight, &undocking)
+				e.beginNodeActions(&nodeActions, &cleaning, &docking)
+			}
 		case ev, ok := <-events:
 			if !ok {
 				return nil
+			}
+			if pausing != nil && undocking && ev.StopChargingCompleted != nil {
+				e.store.SetPaused(true)
+				e.store.SetInstantActionStatus(pausing.ActionID, state.ActionStatusFinished, "")
+				pausing = nil
+			}
+			if interruptedAction && cancelling == nil {
+				matched := false
+				switch {
+				case cleaning != nil && ev.CleanCompleted != nil:
+					e.store.SetActionStatus(cleaning.ActionID, state.ActionStatusFailed, "safety interlock interrupted action")
+					cleaning = nil
+					matched = true
+				case docking != nil && ev.StartChargingCompleted != nil:
+					e.store.SetActionStatus(docking.ActionID, state.ActionStatusFailed, "safety interlock interrupted action")
+					docking = nil
+					matched = true
+				case charge != nil && ev.StartChargingCompleted != nil:
+					e.store.SetInstantActionStatus(charge.ActionID, state.ActionStatusFailed, "safety interlock interrupted action")
+					charge = nil
+					matched = true
+				}
+				if matched {
+					interruptedAction = false
+					continue
+				}
+			}
+			if cancelling != nil {
+				matched := false
+				switch {
+				case cleaning != nil && ev.CleanCompleted != nil:
+					e.store.SetActionStatus(cleaning.ActionID, state.ActionStatusFailed, "order cancelled")
+					cleaning = nil
+					matched = true
+				case docking != nil && docking.ActionType == "startCharging" && ev.StartChargingCompleted != nil:
+					e.store.SetActionStatus(docking.ActionID, state.ActionStatusFailed, "order cancelled")
+					docking = nil
+					matched = true
+				case docking != nil && docking.ActionType == "stopCharging" && ev.StopChargingCompleted != nil:
+					e.completeDocking(ev, &docking)
+					matched = true
+				case undocking && ev.StopChargingCompleted != nil:
+					undocking = false
+					matched = true
+				case (inFlight != nil || stopping) && ev.MoveCompleted != nil:
+					inFlight = nil
+					stopping = false
+					matched = true
+				}
+				if matched {
+					interruptedAction = false
+					if cleaning == nil && docking == nil && !undocking && inFlight == nil && !stopping {
+						e.store.CancelOrder()
+						e.store.SetInstantActionStatus(cancelling.ActionID, state.ActionStatusFinished, "")
+						cancelling = nil
+					}
+					continue
+				}
 			}
 			if undocking && ev.StopChargingCompleted != nil {
 				undocking = false
@@ -163,13 +312,6 @@ func (e *Executor) Start(ctx context.Context) error {
 				continue
 			}
 			if ev.MoveCompleted == nil {
-				continue
-			}
-			if cancelling != nil {
-				// the cancelled move ended; never commit it — finish the cancel
-				e.store.CancelOrder()
-				e.store.SetInstantActionStatus(cancelling.ActionID, state.ActionStatusFinished, "")
-				cancelling = nil
 				continue
 			}
 			if stopping {
@@ -224,11 +366,20 @@ func (e *Executor) plan(o order.Order) []order.Node {
 // fresh order the trivially reachable seq-0 node; they execute at the current
 // node, alongside any movement the plan dispatches.
 func (e *Executor) currentActions(o order.Order) []order.Action {
-	last := e.store.Snapshot().LastNodeSequenceID
+	snapshot := e.store.Snapshot()
+	last := snapshot.LastNodeSequenceID
+	waiting := map[string]bool{}
+	for _, a := range snapshot.ActionStates {
+		waiting[a.ActionID] = a.ActionStatus == state.ActionStatusWaiting
+	}
 	var acts []order.Action
 	for _, n := range o.Nodes {
 		if n.Released && int(n.SequenceID) <= last {
-			acts = append(acts, n.Actions...)
+			for _, a := range n.Actions {
+				if waiting[a.ActionID] {
+					acts = append(acts, a)
+				}
+			}
 		}
 	}
 	return acts
@@ -237,6 +388,9 @@ func (e *Executor) currentActions(o order.Order) []order.Action {
 // beginNodeActions runs the held current-node actions off a single-node order:
 // startCleaning, or startCharging/stopCharging as a self-navigating dock/undock.
 func (e *Executor) beginNodeActions(acts *[]order.Action, cleaning **order.Action, docking **order.Action) {
+	if e.paused || !e.readyToDrive("") {
+		return
+	}
 	pending := *acts
 	*acts = nil
 	for _, a := range pending {
@@ -254,7 +408,7 @@ func (e *Executor) beginNodeActions(acts *[]order.Action, cleaning **order.Actio
 // beginPlan starts dispatching a fresh plan, undocking first when the robot is
 // charging: the first move is held until the undock's end event arrives.
 func (e *Executor) beginPlan(queue *[]order.Node, inFlight **order.Node, undocking *bool) {
-	if len(*queue) == 0 {
+	if len(*queue) == 0 || *inFlight != nil || e.paused || e.settling || !e.readyToDrive((*queue)[0].NodePosition.MapID) {
 		return
 	}
 	if *undocking {
@@ -275,12 +429,14 @@ func (e *Executor) beginPlan(queue *[]order.Node, inFlight **order.Node, undocki
 // handlePause activates pause mode (VDA :707, valid at any time): pause the
 // in-flight operation by kind (clean_pause for a clean, else p2p_pause), gate
 // further dispatching, report the action FINISHED.
-func (e *Executor) handlePause(a order.Action, inFlight *order.Node, cleaning *order.Action, docking *order.Action) {
+func (e *Executor) handlePause(a order.Action, inFlight *order.Node, cleaning *order.Action, docking *order.Action, charge *order.Action) {
 	var err error
 	switch {
 	case cleaning != nil:
 		err = e.cmd.PauseCleaning()
-	case docking != nil:
+	case docking != nil && docking.ActionType == "startCharging":
+		err = e.cmd.PauseDocking()
+	case charge != nil && charge.ActionType == "startCharging":
 		err = e.cmd.PauseDocking()
 	case inFlight != nil:
 		err = e.cmd.PauseMovement()
@@ -288,6 +444,15 @@ func (e *Executor) handlePause(a order.Action, inFlight *order.Node, cleaning *o
 	if err != nil {
 		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "pause dispatch failed: "+err.Error())
 		return
+	}
+	if cleaning != nil {
+		e.store.SetActionStatus(cleaning.ActionID, state.ActionStatusPaused, "")
+	}
+	if docking != nil && docking.ActionType == "startCharging" {
+		e.store.SetActionStatus(docking.ActionID, state.ActionStatusPaused, "")
+	}
+	if charge != nil && charge.ActionType == "startCharging" {
+		e.store.SetInstantActionStatus(charge.ActionID, state.ActionStatusPaused, "")
 	}
 	e.paused = true
 	e.store.SetPaused(true)
@@ -297,7 +462,11 @@ func (e *Executor) handlePause(a order.Action, inFlight *order.Node, cleaning *o
 // handleResume deactivates pause mode: resume the in-flight operation by kind
 // (clean_continue with the order's bypassBlackout, else p2p_continue), then
 // dispatch whatever was held. Resuming a non-paused vehicle is a no-op FINISHED.
-func (e *Executor) handleResume(a order.Action, queue *[]order.Node, inFlight **order.Node, cleaning *order.Action, docking *order.Action) {
+func (e *Executor) handleResume(a order.Action, queue *[]order.Node, inFlight **order.Node, undocking *bool, cleaning *order.Action, docking *order.Action, charge *order.Action) {
+	if e.paused && !e.readyToDrive("") {
+		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "robot is not ready for automatic driving")
+		return
+	}
 	if e.paused {
 		var err error
 		switch {
@@ -308,7 +477,9 @@ func (e *Executor) handleResume(a order.Action, queue *[]order.Node, inFlight **
 				return
 			}
 			err = e.cmd.ResumeCleaning(bypass)
-		case docking != nil:
+		case docking != nil && docking.ActionType == "startCharging":
+			err = e.cmd.ResumeDocking()
+		case charge != nil && charge.ActionType == "startCharging":
 			err = e.cmd.ResumeDocking()
 		case *inFlight != nil:
 			err = e.cmd.ResumeMovement()
@@ -318,14 +489,39 @@ func (e *Executor) handleResume(a order.Action, queue *[]order.Node, inFlight **
 			return
 		}
 	}
+	if cleaning != nil {
+		e.store.SetActionStatus(cleaning.ActionID, state.ActionStatusRunning, "")
+	}
+	if docking != nil && docking.ActionType == "startCharging" {
+		e.store.SetActionStatus(docking.ActionID, state.ActionStatusRunning, "")
+	}
+	if charge != nil && charge.ActionType == "startCharging" {
+		e.store.SetInstantActionStatus(charge.ActionID, state.ActionStatusRunning, "")
+	}
 	e.paused = false
 	e.store.SetPaused(false)
 	e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFinished, "")
-	e.dispatchNext(queue, inFlight)
+	e.beginPlan(queue, inFlight, undocking)
+}
+
+func (e *Executor) readyToDrive(mapID string) bool {
+	snapshot := e.store.Snapshot()
+	if snapshot.SafetyState.ActiveEmergencyStop != state.ActiveEmergencyStopNone || snapshot.SafetyState.FieldViolation {
+		return false
+	}
+	for _, err := range snapshot.Errors {
+		if err.ErrorLevel == state.ErrorLevelFatal || err.ErrorLevel == state.ErrorLevelCritical {
+			return false
+		}
+	}
+	mode := e.store.RequestedOperatingMode()
+	return snapshot.MobileRobotPosition != nil && snapshot.MobileRobotPosition.Localized &&
+		(mapID == "" || snapshot.MobileRobotPosition.MapID == mapID) &&
+		(mode == state.OperatingModeAutomatic || mode == state.OperatingModeSemiAutomatic)
 }
 
 func (e *Executor) dispatchNext(queue *[]order.Node, inFlight **order.Node) {
-	if e.paused || e.settling || *inFlight != nil || len(*queue) == 0 {
+	if e.paused || e.settling || *inFlight != nil || len(*queue) == 0 || !e.readyToDrive((*queue)[0].NodePosition.MapID) {
 		return
 	}
 	n := (*queue)[0]
@@ -347,6 +543,10 @@ func (e *Executor) dispatchNext(queue *[]order.Node, inFlight **order.Node) {
 // another instant action is executing (instant actions must not conflict with
 // the running order).
 func (e *Executor) handleInstantAction(a order.Action, busy bool, charge **order.Action) {
+	if !e.readyToDrive("") {
+		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "robot is not ready for automatic driving")
+		return
+	}
 	if busy || *charge != nil {
 		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "another operation is executing")
 		return
@@ -365,16 +565,18 @@ func (e *Executor) handleInstantAction(a order.Action, busy bool, charge **order
 		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, err.Error())
 		return
 	}
+	e.operationMap = e.currentMap()
 	e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusRunning, "")
 	ac := a
 	*charge = &ac
 }
 
-// handleCancel implements the cancelOrder instant action: stop the in-flight
-// operation by kind (clean_stop for a clean, else the move's stop whose end
-// event completes the cancel), then clear the held order. Idle vehicle or an
-// orderId parameter naming a different order fails with NO_ORDER_TO_CANCEL.
-func (e *Executor) handleCancel(a order.Action, queue *[]order.Node, nodeActions *[]order.Action, inFlight **order.Node, cleaning **order.Action, docking **order.Action, cancelling **order.Action) {
+// A successful stop write is not evidence that movement or an action has stopped.
+func (e *Executor) handleCancel(a order.Action, queue *[]order.Node, nodeActions *[]order.Action, inFlight **order.Node, cleaning **order.Action, docking **order.Action, cancelling **order.Action, waiting bool) {
+	if *cancelling != nil {
+		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "order cancellation already running")
+		return
+	}
 	snap := e.store.Snapshot()
 	if wanted, ok := cancelTargetOrderID(a); ok && wanted != snap.OrderID {
 		e.failCancel(a, fmt.Sprintf("no active order %q", wanted))
@@ -384,37 +586,26 @@ func (e *Executor) handleCancel(a order.Action, queue *[]order.Node, nodeActions
 		e.failCancel(a, "vehicle is idle; no order to cancel")
 		return
 	}
-
+	var err error
+	switch {
+	case !waiting && *cleaning != nil:
+		err = e.cmd.StopCleaning()
+	case !waiting && *docking != nil && (*docking).ActionType == "startCharging":
+		err = e.cmd.AbortDocking()
+	case !waiting && *inFlight != nil:
+		err = e.cmd.StopMovement()
+	}
+	if err != nil {
+		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "stop dispatch failed: "+err.Error())
+		return
+	}
+	e.store.BeginOrderCancellation()
 	*queue = nil
 	*nodeActions = nil
-	if *cleaning != nil {
-		// spec :477 a running clean is cancelled on the robot, not dropped;
-		// stop-write failure keeps it held so a real clean_end still resolves it
-		if err := e.cmd.StopCleaning(); err != nil {
-			e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "clean stop dispatch failed: "+err.Error())
-			return
-		}
-		*cleaning = nil // its actionState fails via CancelOrder; a late end event is stale
-	}
-	if *docking != nil {
-		// a running dock is aborted on the robot (dock_stop, distinct from undock),
-		// not dropped; stop-write failure keeps it held so a real dock end resolves it
-		if err := e.cmd.AbortDocking(); err != nil {
-			e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "dock stop dispatch failed: "+err.Error())
-			return
-		}
-		*docking = nil // its actionState fails via CancelOrder; a late dock end is stale
-	}
-	if *inFlight != nil {
-		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusRunning, "")
-		if err := e.cmd.StopMovement(); err != nil {
-			e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusFailed, "stop dispatch failed: "+err.Error())
-			*inFlight = nil
-			return
-		}
-		*inFlight = nil
+	if *cleaning != nil || *docking != nil || *inFlight != nil || waiting {
 		ac := a
 		*cancelling = &ac
+		e.store.SetInstantActionStatus(a.ActionID, state.ActionStatusRunning, "")
 		return
 	}
 	e.store.CancelOrder()
@@ -482,6 +673,13 @@ func (e *Executor) reportUnreachable(n order.Node, reason string) {
 	})
 }
 
+func (e *Executor) currentMap() string {
+	if pose := e.store.Snapshot().MobileRobotPosition; pose != nil {
+		return pose.MapID
+	}
+	return ""
+}
+
 func (e *Executor) currentHeading() float64 {
 	if p := e.store.Snapshot().MobileRobotPosition; p != nil {
 		return p.Theta
@@ -493,7 +691,7 @@ func (e *Executor) currentHeading() float64 {
 // allowed deviation (default radius when the order specifies none).
 func (e *Executor) withinDeviation(n order.Node) bool {
 	pos := e.store.Snapshot().MobileRobotPosition
-	if pos == nil || n.NodePosition == nil {
+	if pos == nil || !pos.Localized || n.NodePosition == nil || pos.MapID != n.NodePosition.MapID {
 		return false
 	}
 	radius := defaultDeviationXY

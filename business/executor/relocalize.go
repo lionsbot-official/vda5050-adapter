@@ -1,68 +1,18 @@
 package executor
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/lionsbot-official/vda5050-adapter/business/common/actionparams"
 
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/order"
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/state"
 	"github.com/lionsbot-official/vda5050-adapter/business/robotbus"
 )
 
-// relocalizePose is the world-frame pose an initializePosition action carries.
-// LastNodeID is accepted but unused (the robot command takes only the pose).
-type relocalizePose struct {
-	X, Y, Theta float64
-	MapID       string
-	LastNodeID  string
-}
+type relocalizePose = actionparams.Pose
 
-// relocalizeParams extracts the initializePosition arguments (VDA5050_EN.md:714:
-// x/y/theta metres+radians, mapId, lastNodeId) as they arrive off the wire.
-// x/y/theta and a non-empty mapId are required; a zero coordinate is valid.
-func relocalizeParams(a order.Action) (relocalizePose, error) {
-	var pose relocalizePose
-	var haveX, haveY, haveTheta bool
-	for _, p := range a.ActionParameters {
-		switch p.Key {
-		case "x":
-			f, ok := p.Value.(float64)
-			if !ok {
-				return relocalizePose{}, fmt.Errorf("x parameter is %T, want number", p.Value)
-			}
-			pose.X, haveX = f, true
-		case "y":
-			f, ok := p.Value.(float64)
-			if !ok {
-				return relocalizePose{}, fmt.Errorf("y parameter is %T, want number", p.Value)
-			}
-			pose.Y, haveY = f, true
-		case "theta":
-			f, ok := p.Value.(float64)
-			if !ok {
-				return relocalizePose{}, fmt.Errorf("theta parameter is %T, want number", p.Value)
-			}
-			pose.Theta, haveTheta = f, true
-		case "mapId":
-			s, ok := p.Value.(string)
-			if !ok {
-				return relocalizePose{}, fmt.Errorf("mapId parameter is %T, want string", p.Value)
-			}
-			pose.MapID = s
-		case "lastNodeId":
-			if s, ok := p.Value.(string); ok {
-				pose.LastNodeID = s // accepted, unused
-			}
-		}
-	}
-	if !haveX || !haveY || !haveTheta {
-		return relocalizePose{}, errors.New("initializePosition requires x, y and theta")
-	}
-	if pose.MapID == "" {
-		return relocalizePose{}, errors.New("initializePosition requires mapId")
-	}
-	return pose, nil
-}
+func relocalizeParams(a order.Action) (relocalizePose, error) { return actionparams.Relocalize(a) }
 
 // handleRelocalize serves initializePosition: fail while another operation runs,
 // on malformed params, or when the target map is not the robot's active map
@@ -106,7 +56,10 @@ func (e *Executor) completeRelocalize(done *robotbus.RelocalizeCompleted, reloc 
 		return
 	}
 	if done.Success {
-		e.store.SetInstantActionStatus((*reloc).ActionID, state.ActionStatusFinished, "")
+		pose, _ := relocalizeParams(**reloc)
+		e.store.CompleteRelocalization((*reloc).ActionID, state.MobileRobotPosition{
+			X: pose.X, Y: pose.Y, Theta: pose.Theta, MapID: pose.MapID, Localized: true,
+		}, pose.LastNodeID)
 	} else {
 		e.store.SetInstantActionStatus((*reloc).ActionID, state.ActionStatusFailed,
 			fmt.Sprintf("relocalization failed (localization score %.2f)", done.Score))

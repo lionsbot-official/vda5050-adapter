@@ -3,18 +3,19 @@ package masterbus
 import "github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/order"
 
 type actionScope struct {
-	order   bool
-	instant bool
+	order    bool
+	instant  bool
+	blocking order.BlockingType
 }
 
 // supportedActions is the vehicle's full action vocabulary; anything absent
 // rejects (INVALID_ORDER_ACTION / INVALID_INSTANT_ACTION) so an inert action
 // can never wedge isIdle.
 var supportedActions = map[string]actionScope{
-	"startCleaning": {order: true},
+	"startCleaning": {order: true, blocking: order.BlockingTypeHard},
 	// Dock/undock: instant for a quick dock, node-scoped as an order step.
-	"startCharging": {order: true, instant: true},
-	"stopCharging":  {order: true, instant: true},
+	"startCharging": {order: true, instant: true, blocking: order.BlockingTypeHard},
+	"stopCharging":  {order: true, instant: true, blocking: order.BlockingTypeHard},
 	"cancelOrder":   {instant: true},
 	"startPause":    {instant: true},
 	"stopPause":     {instant: true},
@@ -27,14 +28,14 @@ var supportedActions = map[string]actionScope{
 func unsupportedOrderAction(o order.Order) (string, bool) {
 	for _, n := range o.Nodes {
 		for _, a := range n.Actions {
-			if !supportedActions[a.ActionType].order {
+			if scope := supportedActions[a.ActionType]; !scope.order || (scope.blocking != "" && a.BlockingType != scope.blocking) {
 				return a.ActionType, true
 			}
 		}
 	}
 	for _, e := range o.Edges {
 		for _, a := range e.Actions {
-			if !supportedActions[a.ActionType].order {
+			if scope := supportedActions[a.ActionType]; !scope.order || (scope.blocking != "" && a.BlockingType != scope.blocking) {
 				return a.ActionType, true
 			}
 		}

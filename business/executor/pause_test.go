@@ -174,3 +174,79 @@ func TestExecutor_PauseWriteErrorFails(t *testing.T) {
 		t.Fatal("vehicle marked paused though the pause command failed")
 	}
 }
+
+func TestInstantDockPauseResumeTracksInstantAction(t *testing.T) {
+	store := vehiclestate.New()
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
+	cmd := newFakeCommander()
+	e := New(store, cmd)
+	startExecutor(t, e)
+	dock := order.Action{ActionID: "dock", ActionType: "startCharging"}
+	acceptInstant(store, dock)
+	e.InstantAction(dock)
+	<-cmd.chargeStarts
+	pause := order.Action{ActionID: "pause", ActionType: "startPause"}
+	acceptInstant(store, pause)
+	e.InstantAction(pause)
+	select {
+	case <-cmd.dockPauses:
+	case <-time.After(2 * time.Second):
+		t.Fatal("instant docking did not receive pause")
+	}
+	waitInstantStatus(t, store, "dock", state.ActionStatusPaused)
+	resume := order.Action{ActionID: "resume", ActionType: "stopPause"}
+	acceptInstant(store, resume)
+	e.InstantAction(resume)
+	select {
+	case <-cmd.dockResumes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("instant docking did not receive resume")
+	}
+	waitInstantStatus(t, store, "dock", state.ActionStatusRunning)
+}
+
+func TestPauseLeavesNonpausableUndockRunning(t *testing.T) {
+	store := vehiclestate.New()
+	seedDockStore(store, "stopCharging")
+	cmd := newFakeCommander()
+	e := New(store, cmd)
+	startExecutor(t, e)
+	e.OrderAccepted(dockNodeOrder("stopCharging"))
+	<-cmd.chargeStops
+	pause := order.Action{ActionID: "pause", ActionType: "startPause"}
+	acceptInstant(store, pause)
+	e.InstantAction(pause)
+	waitInstantStatus(t, store, "pause", state.ActionStatusFinished)
+	waitActionStatus(t, store, "d1", state.ActionStatusRunning)
+	waitPaused(t, store, true)
+	select {
+	case <-cmd.dockPauses:
+		t.Fatal("pause sent to nonpausable undock")
+	default:
+	}
+	cmd.events <- robotbus.ExecutionEvent{StopChargingCompleted: &robotbus.ChargingCompleted{Success: true}}
+	waitActionStatus(t, store, "d1", state.ActionStatusFinished)
+}
+
+func TestAutoUndockPauseWaitsForStandstill(t *testing.T) {
+	store := vehiclestate.New()
+	seedStore(store, 0, 0)
+	setCharging(store, true)
+	cmd := newFakeCommander()
+	e := New(store, cmd)
+	startExecutor(t, e)
+	e.OrderAccepted(singleTargetOrder())
+	<-cmd.chargeStops
+	pause := order.Action{ActionID: "pause", ActionType: "startPause"}
+	acceptInstant(store, pause)
+	e.InstantAction(pause)
+	waitInstantStatus(t, store, "pause", state.ActionStatusRunning)
+	cmd.events <- robotbus.ExecutionEvent{StopChargingCompleted: &robotbus.ChargingCompleted{Success: true}}
+	waitInstantStatus(t, store, "pause", state.ActionStatusFinished)
+	waitPaused(t, store, true)
+	select {
+	case <-cmd.moves:
+		t.Fatal("automatic move started after pending pause")
+	case <-time.After(20 * time.Millisecond):
+	}
+}

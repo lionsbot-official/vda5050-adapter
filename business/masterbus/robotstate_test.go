@@ -202,3 +202,24 @@ func TestDecideOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestMergePreservesReleasedStitchInstructions(t *testing.T) {
+	base := order.Order{OrderID: "o1", Nodes: []order.Node{{NodeID: "n0", Released: true, Actions: []order.Action{{ActionID: "original", ActionType: "startCharging"}}}}}
+	update := order.Order{OrderID: "o1", OrderUpdateID: 1, Nodes: []order.Node{{NodeID: "n0", Released: true, Actions: []order.Action{{ActionID: "changed", ActionType: "stopCharging"}}}}}
+	got := mergeOrder(base, update)
+	if len(got.Nodes) != 1 || len(got.Nodes[0].Actions) != 1 || got.Nodes[0].Actions[0].ActionID != "original" {
+		t.Fatalf("update replaced released stitch instructions: %+v", got)
+	}
+}
+
+func TestClearedOrderCannotBeContinuedAfterModeRecovery(t *testing.T) {
+	r := newRobotState(vehiclestate.New())
+	r.applyOrder(order.Order{OrderID: "old", Nodes: []order.Node{{NodeID: "n0", Released: true}}})
+	manual, automatic := state.OperatingModeManual, state.OperatingModeAutomatic
+	r.store.SetTelemetry(vehiclestate.Telemetry{OperatingMode: &manual})
+	r.store.SetTelemetry(vehiclestate.Telemetry{OperatingMode: &automatic})
+	decision, errorType := r.decideOrder(order.Order{OrderID: "old", OrderUpdateID: 1, Nodes: []order.Node{{NodeID: "n0", Released: true}}})
+	if decision != decisionReject || errorType != state.ErrorTypeValidationFailure {
+		t.Fatalf("cleared order update = %v/%s", decision, errorType)
+	}
+}

@@ -109,6 +109,7 @@ func TestExecutor_PauseResumeMidDock_RoutesByOpKind(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	waitPaused(t, store, true)
+	waitActionStatus(t, store, "d1", state.ActionStatusPaused)
 	waitInstantStatus(t, store, "dp1", state.ActionStatusFinished)
 
 	// stopPause during a dock: dock_continue, never p2p_continue/clean_continue
@@ -128,6 +129,7 @@ func TestExecutor_PauseResumeMidDock_RoutesByOpKind(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	waitPaused(t, store, false)
+	waitActionStatus(t, store, "d1", state.ActionStatusRunning)
 	waitInstantStatus(t, store, "dp2", state.ActionStatusFinished)
 }
 
@@ -152,8 +154,14 @@ func TestExecutor_CancelMidDock_StopsAndClears(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelOrder mid-dock did not send dock_stop")
 	}
-	waitInstantStatus(t, store, "dc1", state.ActionStatusFinished)
+	waitInstantStatus(t, store, "dc1", state.ActionStatusRunning)
+	if vehiclestate.IsIdle(store.Snapshot()) {
+		t.Fatal("order became idle before robot completion")
+	}
+	waitActionStatus(t, store, "d1", state.ActionStatusRunning)
+	cmd.events <- robotbus.ExecutionEvent{StartChargingCompleted: &robotbus.ChargingCompleted{Success: true}}
 	waitActionStatus(t, store, "d1", state.ActionStatusFailed)
+	waitInstantStatus(t, store, "dc1", state.ActionStatusFinished)
 	if !vehiclestate.IsIdle(store.Snapshot()) {
 		t.Fatal("vehicle not idle after dock cancel")
 	}

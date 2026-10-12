@@ -8,6 +8,7 @@ import (
 
 	"github.com/lionsbot-official/vda5050-adapter/business/common/vehiclestate"
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/cleaningcatalog"
+	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/common"
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/order"
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/model/state"
 )
@@ -69,6 +70,31 @@ func lastState(t *testing.T, b *Bus, ft *fakeTransport) state.State {
 
 func mustOrderBytes(t *testing.T, o order.Order) []byte {
 	t.Helper()
+	if o.Version == "" {
+		o.Header = common.Header{Version: "3.0.0", Timestamp: "2026-10-10T00:00:00.00Z", Manufacturer: "lionsbot", SerialNumber: "TESTBOT"}
+	}
+	o.Nodes = append([]order.Node{}, o.Nodes...)
+	o.Edges = append([]order.Edge{}, o.Edges...)
+	for i := range o.Nodes {
+		if o.Nodes[i].SequenceID > 0 && o.Nodes[i].NodePosition == nil {
+			o.Nodes[i].NodePosition = &order.NodePosition{X: float64(o.Nodes[i].SequenceID), MapID: "map-1"}
+		}
+		o.Nodes[i].Actions = append([]order.Action{}, o.Nodes[i].Actions...)
+		for j := range o.Nodes[i].Actions {
+			if o.Nodes[i].Actions[j].BlockingType == "" {
+				o.Nodes[i].Actions[j].BlockingType = order.BlockingTypeHard
+			}
+		}
+	}
+	for i := range o.Edges {
+		e := &o.Edges[i]
+		e.Actions = append([]order.Action{}, e.Actions...)
+		for j := range e.Actions {
+			if e.Actions[j].BlockingType == "" {
+				e.Actions[j].BlockingType = order.BlockingTypeHard
+			}
+		}
+	}
 	data, err := json.Marshal(o)
 	if err != nil {
 		t.Fatalf("marshal order: %v", err)
@@ -840,4 +866,14 @@ func countPublishOn(ft *fakeTransport, topic string) int {
 		}
 	}
 	return n
+}
+
+func TestProtocolVersionIsFixed(t *testing.T) {
+	for _, version := range []string{"", "2.0.0", "2.1.0", "3.0.1"} {
+		t.Run(version, func(t *testing.T) {
+			if _, err := NewWithTransport(&fakeTransport{}, vehiclestate.New(), "TESTBOT", version, "lionsbot"); err == nil {
+				t.Fatalf("accepted incompatible protocol version %q", version)
+			}
+		})
+	}
 }

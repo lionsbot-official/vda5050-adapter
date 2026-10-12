@@ -56,7 +56,11 @@ func (b *Bus) buildFactsheet() factsheet.Factsheet {
 			},
 		},
 		ProtocolFeatures: factsheet.ProtocolFeatures{
-			OptionalParameters: []factsheet.OptionalParameter{},
+			OptionalParameters: []factsheet.OptionalParameter{
+				{Parameter: "order.nodes.nodePosition", Support: factsheet.SupportRequired, Description: "Required for destination nodes on the active map"},
+				{Parameter: "order.nodes.nodePosition.theta", Support: factsheet.SupportSupported},
+				{Parameter: "order.nodes.nodePosition.allowedDeviationXY", Support: factsheet.SupportSupported, Description: "Positive circular tolerances only (a = b)"},
+			},
 			MobileRobotActions: mobileRobotActions(),
 		},
 	}
@@ -75,37 +79,53 @@ func mobileRobotActions() []factsheet.MobileRobotAction {
 	}
 	return []factsheet.MobileRobotAction{
 		{
-			ActionType:    "startCleaning",
-			ActionScopes:  []factsheet.ActionScope{factsheet.ScopeNode},
-			PauseAllowed:  true,
-			CancelAllowed: true,
-			BlockingTypes: []factsheet.BlockingType{factsheet.BlockingHard},
+			ActionType:        "startCleaning",
+			ActionDescription: "Single-node, single-action order",
+			ActionScopes:      []factsheet.ActionScope{factsheet.ScopeNode},
+			PauseAllowed:      true,
+			CancelAllowed:     true,
+			BlockingTypes:     []factsheet.BlockingType{factsheet.BlockingHard},
 			ActionParameters: []factsheet.ActionParameter{
 				{Key: "zones", ValueDataType: factsheet.DataTypeArray},
-				{Key: "bypassBlackout", ValueDataType: factsheet.DataTypeBool},
+				{Key: "homePoi", ValueDataType: factsheet.DataTypeObject, IsOptional: new(true), Description: "Legacy ignored field; robot stays put after cleaning. Object with name only."},
+				{Key: "bypassBlackout", ValueDataType: factsheet.DataTypeBool, IsOptional: new(true)},
 			},
 		},
 		// Dock: instant + node-scoped, HARD-blocking. pause/cancel land in a
 		// later slice as dock_pause/dock_stop are wired.
 		{
-			ActionType:    "startCharging",
-			ActionScopes:  []factsheet.ActionScope{factsheet.ScopeInstant, factsheet.ScopeNode},
-			PauseAllowed:  true,
-			CancelAllowed: true,
-			BlockingTypes: []factsheet.BlockingType{factsheet.BlockingHard},
+			ActionType:        "startCharging",
+			ActionDescription: "Instant action or single-node, single-action order",
+			ActionScopes:      []factsheet.ActionScope{factsheet.ScopeInstant, factsheet.ScopeNode},
+			PauseAllowed:      true,
+			CancelAllowed:     true,
+			BlockingTypes:     []factsheet.BlockingType{factsheet.BlockingHard},
 		},
 		// Undock: instant + node-scoped; not controllable once started (the robot
 		// has no undock-pause/stop).
 		{
-			ActionType:    "stopCharging",
-			ActionScopes:  []factsheet.ActionScope{factsheet.ScopeInstant, factsheet.ScopeNode},
-			PauseAllowed:  false,
-			CancelAllowed: false,
+			ActionType:        "stopCharging",
+			ActionDescription: "Instant action or single-node, single-action order",
+			BlockingTypes:     []factsheet.BlockingType{factsheet.BlockingHard},
+			ActionScopes:      []factsheet.ActionScope{factsheet.ScopeInstant, factsheet.ScopeNode},
+			PauseAllowed:      false,
+			CancelAllowed:     false,
 		},
 		instant("cancelOrder"),
 		instant("startPause"),
 		instant("stopPause"),
 		instant("factsheetRequest"),
-		instant("initializePosition"),
+		{
+			ActionType:    "initializePosition",
+			ActionScopes:  []factsheet.ActionScope{factsheet.ScopeInstant},
+			BlockingTypes: []factsheet.BlockingType{factsheet.BlockingNone},
+			ActionParameters: []factsheet.ActionParameter{
+				{Key: "x", ValueDataType: factsheet.DataTypeNumber},
+				{Key: "y", ValueDataType: factsheet.DataTypeNumber},
+				{Key: "theta", ValueDataType: factsheet.DataTypeNumber},
+				{Key: "mapId", ValueDataType: factsheet.DataTypeString},
+				{Key: "lastNodeId", ValueDataType: factsheet.DataTypeString},
+			},
+		},
 	}
 }

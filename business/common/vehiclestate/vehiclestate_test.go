@@ -145,7 +145,7 @@ func TestSetTelemetry_LeavesOrderProjectionUntouched(t *testing.T) {
 		ActionStates:       []state.ActionState{{ActionID: "a1", ActionStatus: state.ActionStatusWaiting}},
 	}
 	s.CommitOrderProjection(p)
-	robotErr := state.Error{ErrorType: state.ErrorTypeMobileRobotNotAvailable, ErrorLevel: state.ErrorLevelFatal}
+	robotErr := state.Error{ErrorType: state.ErrorTypeReleaseLost, ErrorLevel: state.ErrorLevelFatal}
 	s.AddError(robotErr)
 
 	driving := false
@@ -176,5 +176,111 @@ func TestSetTelemetry_LeavesOrderProjectionUntouched(t *testing.T) {
 	}
 	if !reflect.DeepEqual(snap.Errors, []state.Error{robotErr}) {
 		t.Errorf("errors = %+v, want %+v", snap.Errors, []state.Error{robotErr})
+	}
+}
+
+func TestOrderUpdatePreservesActionProgressAndInstantHistory(t *testing.T) {
+	s := New()
+	projection := OrderProjection{OrderID: "order-1", ActionStates: []state.ActionState{{ActionID: "clean-1", ActionStatus: state.ActionStatusWaiting}}}
+	s.CommitOrderProjection(projection)
+	s.SetActionStatus("clean-1", state.ActionStatusRunning, "cleaning")
+	s.AddInstantActionState(state.ActionState{ActionID: "instant-1", ActionStatus: state.ActionStatusFinished})
+	projection.KeepLastNode = true
+	projection.OrderUpdateID = 1
+	projection.ActionStates = []state.ActionState{{ActionID: "clean-1", ActionStatus: state.ActionStatusWaiting}, {ActionID: "clean-2", ActionStatus: state.ActionStatusWaiting}}
+	s.CommitOrderProjection(projection)
+	got := s.Snapshot()
+	if got.ActionStates[0].ActionStatus != state.ActionStatusRunning || got.ActionStates[0].ActionResult != "cleaning" || got.ActionStates[1].ActionStatus != state.ActionStatusWaiting {
+		t.Fatalf("update changed action progress: %+v", got.ActionStates)
+	}
+	projection.KeepLastNode = false
+	projection.OrderID = "order-2"
+	s.CommitOrderProjection(projection)
+	if got := s.Snapshot().InstantActionStates; len(got) != 1 || got[0].ActionID != "instant-1" {
+		t.Fatalf("V3 instant history must survive a new order: %+v", got)
+	}
+}
+
+func TestReadinessAndPublisherNotificationsAreIndependent(t *testing.T) {
+	s := New()
+	mode := state.OperatingModeManual
+	s.SetTelemetry(Telemetry{OperatingMode: &mode})
+	select {
+	case <-s.ReadinessChanges():
+	default:
+		t.Fatal("no executor readiness notification")
+	}
+	select {
+	case <-s.Changes():
+	default:
+		t.Fatal("executor readiness consumed publisher notification")
+	}
+}
+
+func TestLocalizationErrorClearsWhenPoseRecovers(t *testing.T) {
+	s := New()
+	s.SetTelemetry(Telemetry{MobileRobotPosition: &state.MobileRobotPosition{MapID: "map-1"}})
+	got := s.Snapshot()
+	if len(got.Errors) != 1 || got.Errors[0].ErrorType != state.ErrorTypeLocalizationError || got.Errors[0].ErrorLevel != state.ErrorLevelFatal {
+		t.Fatalf("unlocalized pose missing fatal error: %+v", got.Errors)
+	}
+	s.SetTelemetry(Telemetry{MobileRobotPosition: &state.MobileRobotPosition{MapID: "map-1"}})
+	if len(s.Snapshot().Errors) != 1 {
+		t.Fatal("repeated unlocalized telemetry duplicated error")
+	}
+	s.SetTelemetry(Telemetry{MobileRobotPosition: &state.MobileRobotPosition{MapID: "map-1", Localized: true}})
+	if len(s.Snapshot().Errors) != 0 {
+		t.Fatal("localization recovery left fatal error")
+	}
+}
+
+func TestAvailableOperatingModeClearsAvailabilityError(t *testing.T) {
+	s := New()
+	s.AddError(state.Error{ErrorType: state.ErrorTypeMobileRobotNotAvailable, ErrorLevel: state.ErrorLevelWarning})
+	mode := state.OperatingModeManual
+	s.SetTelemetry(Telemetry{OperatingMode: &mode})
+	if len(s.Snapshot().Errors) != 1 {
+		t.Fatal("unavailable mode cleared its error")
+	}
+	mode = state.OperatingModeIntervened
+	s.SetTelemetry(Telemetry{OperatingMode: &mode})
+	if len(s.Snapshot().Errors) != 0 {
+		t.Fatal("order-accepting mode retained availability error")
+	}
+}
+
+func TestClearingModesPreserveOrderHistoryAndResetLastNodeOnlyWhenRequired(t *testing.T) {
+	for _, mode := range []state.OperatingMode{state.OperatingModeManual, state.OperatingModeService, state.OperatingModeTeachIn, state.OperatingModeStartup} {
+		t.Run(string(mode), func(t *testing.T) {
+			s := New()
+			s.CommitOrderProjection(OrderProjection{OrderID: "old", OrderUpdateID: 3, LastNodeID: "n7", LastNodeSequenceID: 6,
+				ActionStates: []state.ActionState{{ActionID: "finished", ActionStatus: state.ActionStatusFinished}}})
+			s.SetTelemetry(Telemetry{OperatingMode: &mode})
+			got := s.Snapshot()
+			wantNode := ""
+			if mode == state.OperatingModeManual {
+				wantNode = "n7"
+			}
+			if got.OperatingMode != mode || got.OrderID != "old" || got.OrderUpdateID != 3 || got.LastNodeID != wantNode || got.LastNodeSequenceID != 6 || len(got.ActionStates) != 1 || !s.OrderCleared() || s.OrderCancelled() {
+				t.Fatalf("incorrect mode clear: %+v", got)
+			}
+		})
+	}
+}
+
+func TestPendingModeClearRetainsAvailabilityErrorUntilCompletion(t *testing.T) {
+	s := New()
+	s.CommitOrderProjection(OrderProjection{OrderID: "old", NodeStates: []state.NodeState{{NodeID: "target"}}})
+	mode := state.OperatingModeManual
+	s.SetTelemetry(Telemetry{OperatingMode: &mode})
+	s.AddError(state.Error{ErrorType: state.ErrorTypeMobileRobotNotAvailable, ErrorLevel: state.ErrorLevelWarning})
+	mode = state.OperatingModeAutomatic
+	s.SetTelemetry(Telemetry{OperatingMode: &mode})
+	if !s.ModeChangePending() || len(s.Snapshot().Errors) != 1 {
+		t.Fatal("pending mode clear must retain unavailability")
+	}
+	s.CompleteModeTransition()
+	if s.ModeChangePending() || len(s.Snapshot().Errors) != 0 {
+		t.Fatal("completed transition to automatic must clear unavailability")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lionsbot-official/vda5050-adapter/business/common/actionparams"
 	topichelper "github.com/lionsbot-official/vda5050-adapter/business/common/topic"
 	"github.com/lionsbot-official/vda5050-adapter/business/common/vehiclestate"
 	"github.com/lionsbot-official/vda5050-adapter/business/masterbus/infra/transport"
@@ -38,6 +39,7 @@ type Transport interface {
 }
 
 type Bus struct {
+	intakeMu            sync.Mutex
 	transport           Transport
 	version             string
 	serialNumber        string
@@ -97,6 +99,9 @@ func (b *Bus) StartChangePublisher(ctx context.Context) {
 }
 
 func NewWithTransport(transport Transport, store *vehiclestate.Store, serialNumber, version, manufacturer string) (*Bus, error) {
+	if version != "3.0.0" {
+		return nil, fmt.Errorf("this adapter requires VDA5050 3.0.0, got %q", version)
+	}
 
 	connTopic, err := topichelper.ToTopic(topichelper.TopicConnection, version, manufacturer, serialNumber)
 	if err != nil {
@@ -220,8 +225,10 @@ func (b *Bus) StartInstantActionsConsumer(ctx context.Context, msgs <-chan []byt
 }
 
 func (b *Bus) handleInstantActions(msg []byte) {
+	b.intakeMu.Lock()
+	defer b.intakeMu.Unlock()
 	var ia instantactions.InstantActions
-	if err := json.Unmarshal(msg, &ia); err != nil {
+	if err := validateMessage(msg, instantActionsSchema, &ia); err != nil {
 		slog.Error("bus: failed to unmarshal instant actions", "err", err)
 		b.robot.addError(state.Error{
 			ErrorType:        state.ErrorTypeValidationFailure,
@@ -232,8 +239,27 @@ func (b *Bus) handleInstantActions(msg []byte) {
 		return
 	}
 
+	if err := b.validateHeader(ia.Header); err != nil {
+		b.robot.addError(state.Error{ErrorType: state.ErrorTypeValidationFailure, ErrorLevel: state.ErrorLevelWarning, ErrorDescription: err.Error()})
+		b.publishState()
+		return
+	}
+
 	for _, a := range ia.Actions {
-		if !supportedActions[a.ActionType].instant {
+		duplicate := false
+		current := b.robot.store.Snapshot()
+		for _, tracked := range append(current.ActionStates, current.InstantActionStates...) {
+			if tracked.ActionID == a.ActionID {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		mode := b.robot.store.RequestedOperatingMode()
+		allowedMode := mode == state.OperatingModeAutomatic || mode == state.OperatingModeSemiAutomatic || (mode == state.OperatingModeIntervened && a.ActionType == "cancelOrder")
+		if !allowedMode || !supportedActions[a.ActionType].instant || actionparams.Validate(a) != nil {
 			slog.Warn("instant action rejected: unsupported", "actionId", a.ActionID, "actionType", a.ActionType)
 			b.robot.store.AddInstantActionState(state.ActionState{
 				ActionID:     a.ActionID,
@@ -290,8 +316,10 @@ func (b *Bus) rejectOrder(o order.Order, errorType state.ErrorType, reason error
 }
 
 func (b *Bus) handleOrder(msg []byte) {
+	b.intakeMu.Lock()
+	defer b.intakeMu.Unlock()
 	var o order.Order
-	if err := json.Unmarshal(msg, &o); err != nil {
+	if err := validateMessage(msg, orderSchema, &o); err != nil {
 		slog.Error("bus: failed to unmarshal order", "err", err)
 		b.robot.addError(state.Error{
 			ErrorType:        state.ErrorTypeValidationFailure,
@@ -299,6 +327,11 @@ func (b *Bus) handleOrder(msg []byte) {
 			ErrorDescription: err.Error(),
 		})
 		b.publishState()
+		return
+	}
+
+	if err := b.validateHeader(o.Header); err != nil {
+		b.rejectOrder(o, state.ErrorTypeValidationFailure, err)
 		return
 	}
 
@@ -310,10 +343,39 @@ func (b *Bus) handleOrder(msg []byte) {
 		return
 	}
 
+	if err := validateTopology(o); err != nil {
+		b.rejectOrder(o, state.ErrorTypeValidationFailure, err)
+		return
+	}
+	mode := b.robot.store.RequestedOperatingMode()
+	if mode != state.OperatingModeAutomatic && mode != state.OperatingModeSemiAutomatic && mode != state.OperatingModeIntervened {
+		b.rejectOrder(o, state.ErrorTypeMobileRobotNotAvailable, fmt.Errorf("operating mode %s does not permit orders", mode))
+		return
+	}
+
+	if field := b.unsupportedOrderField(o); field != "" {
+		b.robot.addError(state.Error{
+			ErrorType: state.ErrorTypeUnsupportedParameter, ErrorLevel: state.ErrorLevelCritical,
+			ErrorDescription: "unsupported order parameter: " + field,
+			ErrorReferences:  []state.ErrorReference{{ReferenceKey: "orderId", ReferenceValue: o.OrderID}, {ReferenceKey: "parameter", ReferenceValue: field}},
+		})
+		b.publishState()
+		return
+	}
+
 	if actionType, ok := unsupportedOrderAction(o); ok {
 		slog.Warn("order rejected: unsupported action", "orderId", o.OrderID, "actionType", actionType)
 		b.rejectOrder(o, state.ErrorTypeInvalidOrderAction, fmt.Errorf("bus: unsupported order action %q", actionType))
 		return
+	}
+
+	for _, n := range o.Nodes {
+		for _, a := range n.Actions {
+			if err := actionparams.Validate(a); err != nil {
+				b.rejectOrder(o, state.ErrorTypeInvalidOrderAction, err)
+				return
+			}
+		}
 	}
 
 	decision, errorType := b.robot.decideOrder(o)
@@ -324,6 +386,10 @@ func (b *Bus) handleOrder(msg []byte) {
 	case decisionIgnore:
 		slog.Info("duplicate order ignored", "orderId", o.OrderID)
 	case decisionAcceptUpdate:
+		if field := b.unsupportedOrderField(mergeOrder(b.robot.merged, o)); field != "" {
+			b.rejectOrder(o, state.ErrorTypeInvalidOrderAction, fmt.Errorf("unsupported merged order field %s", field))
+			return
+		}
 		b.robot.applyOrderUpdate(o)
 		b.publishState()
 		b.notifyOrderAccepted()

@@ -107,6 +107,9 @@ func (r *robotState) decideOrder(o order.Order) (orderDecision, state.ErrorType)
 	cur := r.current
 
 	if st.OrderID != "" && o.OrderID == st.OrderID {
+		if r.store.OrderCleared() {
+			return decisionReject, state.ErrorTypeValidationFailure
+		}
 		if r.store.OrderCancelled() {
 			return decisionReject, state.ErrorTypeOrderUpdateFollowingCancel
 		}
@@ -215,11 +218,15 @@ func mergeOrder(base, update order.Order) order.Order {
 
 	nodes := make([]order.Node, 0, len(base.Nodes)+len(update.Nodes))
 	for _, n := range base.Nodes {
-		if n.SequenceID < dp {
+		if n.SequenceID <= dp {
 			nodes = append(nodes, n)
 		}
 	}
-	nodes = append(nodes, update.Nodes...)
+	for _, n := range update.Nodes {
+		if n.SequenceID > dp {
+			nodes = append(nodes, n)
+		}
+	}
 
 	edges := make([]order.Edge, 0, len(base.Edges)+len(update.Edges))
 	for _, e := range base.Edges {

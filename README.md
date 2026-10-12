@@ -15,6 +15,22 @@ robot's MQTT topics; the adapter does the rest.
 
 ---
 
+## Choose a protocol edition
+
+Each branch contains one implementation. `MASTER_VERSION` must match that branch;
+it cannot switch protocol editions.
+
+| VDA5050 edition | Branch | Initial release tag | Adapter fix example |
+|---|---|---|---|
+| 3.0.0 | `main` | `v3.0.0` | `v3.0.0+adapter.1` |
+| 2.1.0 | `vda-2.1.0` | `v2.1.0` | `v2.1.0+adapter.1` |
+| 2.0.0 | `vda-2.0.0` | `v2.0.0` | `v2.0.0+adapter.1` |
+
+Select a published tag for deployment and build from its source checkout or release
+archive. These are source release labels, not Go module major-version paths.
+The older `v1.0.0` release also implements VDA5050 3.0.0; it keeps its original name.
+See each edition's README and factsheet for its supported capabilities.
+
 ## 1. Quick start
 
 You need Go 1.26+, an MQTT broker your fleet master uses, and LionsBot account
@@ -66,8 +82,8 @@ Examples below use `R3-0001` — substitute your serial.
 
 Every message carries the standard VDA5050 header: `headerId` (you increment per topic),
 `timestamp` (ISO8601 UTC `YYYY-MM-DDTHH:mm:ss.fffZ`), `version` (`3.0.0`), `manufacturer`
-(`lionsbot`), `serialNumber`. **The adapter routes off the topic, not the body** — the
-serial in the topic is what matters.
+(`lionsbot`), `serialNumber`. The header version and vehicle identity must match
+the adapter configuration; malformed or mismatched messages are rejected.
 
 Examples use [mosquitto](https://mosquitto.org/) (`-h`/`-p`/`-u`/`-P` = your broker):
 
@@ -135,16 +151,16 @@ mosquitto_pub $BROKER -t "vda5050/v3/lionsbot/$SER/order" -m '{
   ],
   "edges": [
     { "edgeId": "e1", "sequenceId": 1, "released": true,
-      "startNodeId": "n0", "endNodeId": "n1", "actions": [] }
+      "actions": [] }
   ]
 }'
 ```
 
 Notes:
 - The robot is treated as having **reached** a node when it is within the node's
-  `allowedDeviationXY.a` radius (default **0.5 m** if omitted).
+  circular `allowedDeviationXY` (`a = b`, positive radius; default **0.5 m** if omitted).
 - Navigation is **node-position based** — the robot plans its own path; edge geometry
-  (`trajectory`, `corridor`, …) is not used for driving.
+  (`trajectory`, `corridor`, …) is unsupported and rejected when supplied.
 - Multi-stop: add more released nodes (sequenceIds 4, 6, …) with positions. The adapter
   drives them one at a time and reports progress via `lastNodeId` in `state`.
 
@@ -178,6 +194,7 @@ mosquitto_pub $BROKER -t "vda5050/v3/lionsbot/$SER/order" -m '{
 |---|---|---|
 | `zones` | array | one entry per zone: `{ "name": "<zone>" }`, plus optional per-zone `"cleaningMode": "<mode>"` and `"configs": { "<setting>": <number> }` overrides. Omit the overrides to use the zone's catalog/robot default. |
 | `bypassBlackout` | bool | run even during a configured blackout window |
+| `homePoi` | object | legacy compatibility only: `{ "name": "<poi>" }` is accepted but ignored; the robot stays put after cleaning |
 
 Track the clean via its `actionState` in `state.actionStates`
 (`WAITING` → `RUNNING` → `FINISHED`/`FAILED`).
@@ -257,12 +274,14 @@ reset its pose with a known position on its current map:
 "actions": [ { "actionId": "ip-1", "actionType": "initializePosition", "blockingType": "NONE",
   "actionParameters": [
     { "key": "x", "value": 12.5 }, { "key": "y", "value": 3.0 },
-    { "key": "theta", "value": 1.57 }, { "key": "mapId", "value": "map-1" }
+    { "key": "theta", "value": 1.57 }, { "key": "mapId", "value": "map-1" },
+    { "key": "lastNodeId", "value": "" }
   ] } ]
 ```
 
 `x`/`y` are metres and `theta` radians in the site frame (same convention as node
-positions). The action reaches `FINISHED` when the robot re-localizes, or `FAILED`
+positions). `lastNodeId` is required; use an empty string when no node is known.
+The action reaches `FINISHED` when the robot re-localizes, or `FAILED`
 (with the localization score in the reason) when it cannot. This version is
 single-map: a `mapId` that is not the robot's current map is rejected, and it is
 rejected while an order (move/clean/dock) is in flight.
@@ -328,6 +347,17 @@ and the `cleaningcatalog` vendor topic.
 **Not yet implemented:** the `visualization` topic, `zoneSet`/`zones` handling
 (`typeSpecification.supportedZones` is empty), VDA5050 map distribution, cross-map
 relocalization (`initializePosition` is single-map only), and the `spotClean` action.
+
+The supported order profile is either movement without node actions, or one node
+with one HARD cleaning/docking action. Supplied edge motion constraints, edge
+actions, corridors, trajectories, retry requests, angular tolerances and
+noncircular position tolerances are rejected. Navigation requires positions on
+the active map; these limits are reflected in the factsheet.
+
+V3 freely navigating path sharing is incomplete: the adapter does not yet publish
+`intermediatePath`, and robot feedback may not provide a complete `plannedPath`.
+Do not treat message/schema validation as full VDA5050 conformance or hardware
+acceptance. The published physical profile must match the deployed robot.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 

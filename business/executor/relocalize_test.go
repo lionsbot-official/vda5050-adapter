@@ -21,7 +21,7 @@ func relocalizeAction(id, mapID string, x, y, theta float64) order.Action {
 		ActionID:   id,
 		ActionType: "initializePosition",
 		ActionParameters: []order.ActionParameter{
-			param("x", x), param("y", y), param("theta", theta), param("mapId", mapID),
+			param("x", x), param("y", y), param("theta", theta), param("mapId", mapID), param("lastNodeId", "n7"),
 		},
 	}
 }
@@ -67,6 +67,13 @@ func TestExecutor_RelocalizeRunsToFinished(t *testing.T) {
 
 	cmd.events <- robotbus.ExecutionEvent{RelocalizeCompleted: &robotbus.RelocalizeCompleted{Success: true, Score: 0.95}}
 	waitInstantStatus(t, store, "r1", state.ActionStatusFinished)
+	if got := store.Snapshot().LastNodeID; got != "n7" {
+		t.Fatalf("lastNodeId = %q, want n7", got)
+	}
+	pose := store.Snapshot().MobileRobotPosition
+	if pose == nil || !pose.Localized || pose.X != 1.5 || pose.Y != -2 || pose.Theta != 0.75 || pose.MapID != "map-1" {
+		t.Fatalf("FINISHED must report the confirmed pose, got %+v", pose)
+	}
 }
 
 func TestExecutor_RelocalizeFailureReportsScore(t *testing.T) {
@@ -168,6 +175,7 @@ func TestExecutor_RelocalizeRejectedWhileOrderExecuting(t *testing.T) {
 func TestExecutor_RelocalizeRejectedWhileCharging(t *testing.T) {
 	store := vehiclestate.New()
 	seedPosition(store, "map-1")
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
 	cmd := newFakeCommander()
 	e := New(store, cmd)
 	startExecutor(t, e)
@@ -253,16 +261,16 @@ func TestRelocalizeParams(t *testing.T) {
 			want: relocalizePose{X: 1.5, Y: -2.0, Theta: 0.75, MapID: "map-1", LastNodeID: "n7"},
 		},
 		{
-			name: "lastNodeId optional",
+			name: "lastNodeId required",
 			params: []order.ActionParameter{
 				param("x", 1.5), param("y", 2.0), param("theta", 0.75), param("mapId", "map-1"),
 			},
-			want: relocalizePose{X: 1.5, Y: 2.0, Theta: 0.75, MapID: "map-1"},
+			wantErr: true,
 		},
 		{
 			name: "zero pose is valid, not treated as missing",
 			params: []order.ActionParameter{
-				param("x", 0.0), param("y", 0.0), param("theta", 0.0), param("mapId", "map-1"),
+				param("x", 0.0), param("y", 0.0), param("theta", 0.0), param("mapId", "map-1"), param("lastNodeId", ""),
 			},
 			want: relocalizePose{X: 0, Y: 0, Theta: 0, MapID: "map-1"},
 		},

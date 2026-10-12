@@ -31,6 +31,7 @@ func acceptInstant(s *vehiclestate.Store, a order.Action) {
 
 func TestExecutor_StartChargingActionRunsToFinished(t *testing.T) {
 	store := vehiclestate.New()
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
 	cmd := newFakeCommander()
 	e := New(store, cmd)
 	startExecutor(t, e)
@@ -52,6 +53,7 @@ func TestExecutor_StartChargingActionRunsToFinished(t *testing.T) {
 
 func TestExecutor_StopChargingFailureReported(t *testing.T) {
 	store := vehiclestate.New()
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
 	cmd := newFakeCommander()
 	e := New(store, cmd)
 	startExecutor(t, e)
@@ -106,6 +108,7 @@ func TestExecutor_InstantActionRejectedWhileOrderExecuting(t *testing.T) {
 
 func TestExecutor_ChargingDispatchErrorFails(t *testing.T) {
 	store := vehiclestate.New()
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
 	cmd := newFakeCommander()
 	cmd.chargeErr = errors.New("ws down")
 	e := New(store, cmd)
@@ -172,6 +175,7 @@ func TestExecutor_CancelMidMoveStopsAndClears(t *testing.T) {
 	// vehicle is idle again: a new order dispatches
 	o2 := singleTargetOrder()
 	o2.OrderID = "o2"
+	store.CommitOrderProjection(vehiclestate.OrderProjection{OrderID: "o2", LastNodeID: "n0", NodeStates: []state.NodeState{{NodeID: "n1", SequenceID: 2, Released: true}}, EdgeStates: []state.EdgeState{{EdgeID: "e01", SequenceID: 1, Released: true}}, ActionStates: []state.ActionState{}})
 	e.OrderAccepted(o2)
 	select {
 	case <-cmd.moves:

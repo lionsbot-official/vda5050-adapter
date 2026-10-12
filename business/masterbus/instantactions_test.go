@@ -38,7 +38,7 @@ func TestHandleInstantActions_InitializePositionForwarded(t *testing.T) {
 	var got []order.Action
 	b.SetInstantActionHook(func(a order.Action) { got = append(got, a) })
 
-	msg := []byte(`{"headerId":1,"timestamp":"2026-07-21T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"TESTBOT","actions":[{"actionId":"ip-1","actionType":"initializePosition","blockingType":"NONE","actionParameters":[{"key":"x","value":1.0},{"key":"y","value":2.0},{"key":"theta","value":0.0},{"key":"mapId","value":"map-1"}]}]}`)
+	msg := []byte(`{"headerId":1,"timestamp":"2026-07-21T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"TESTBOT","actions":[{"actionId":"ip-1","actionType":"initializePosition","blockingType":"NONE","actionParameters":[{"key":"x","value":1.0},{"key":"y","value":2.0},{"key":"theta","value":0.0},{"key":"mapId","value":"map-1"},{"key":"lastNodeId","value":""}]}]}`)
 	b.handleInstantActions(msg)
 
 	st := lastState(t, b, ft)

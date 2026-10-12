@@ -8,15 +8,22 @@ import (
 )
 
 type Store struct {
-	mu        sync.Mutex
-	state     state.State
-	changes   chan struct{}
-	cancelled bool // current order was cancelled; updates to it must reject
+	mu            sync.Mutex
+	state         state.State
+	changes       chan struct{}
+	readiness     chan struct{}
+	cancelled     bool // current order was cancelled; updates to it must reject
+	cleared       bool
+	desiredMode   state.OperatingMode
+	pendingMode   state.OperatingMode
+	clearLastNode bool
 }
 
 func New() *Store {
 	return &Store{
-		changes: make(chan struct{}, 1),
+		changes:     make(chan struct{}, 1),
+		readiness:   make(chan struct{}, 1),
+		desiredMode: state.OperatingModeAutomatic,
 		state: state.State{
 			OrderID:             "",
 			OrderUpdateID:       0,
@@ -52,21 +59,42 @@ func (s *Store) Snapshot() state.State {
 func (s *Store) AddError(e state.Error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.notify()
 	for i := range s.state.Errors {
 		if s.state.Errors[i].ErrorType == e.ErrorType &&
 			reflect.DeepEqual(s.state.Errors[i].ErrorReferences, e.ErrorReferences) {
+			wasBlocking := s.state.Errors[i].ErrorLevel == state.ErrorLevelFatal || s.state.Errors[i].ErrorLevel == state.ErrorLevelCritical
+			isBlocking := e.ErrorLevel == state.ErrorLevelFatal || e.ErrorLevel == state.ErrorLevelCritical
 			s.state.Errors[i] = e
+			if wasBlocking != isBlocking {
+				s.notifyReadiness()
+			}
 			return
 		}
 	}
 	s.state.Errors = append(s.state.Errors, e)
-	s.notify()
+	if e.ErrorLevel == state.ErrorLevelFatal || e.ErrorLevel == state.ErrorLevelCritical {
+		s.notifyReadiness()
+	}
 }
 
 func (s *Store) AddInstantActionState(as state.ActionState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.InstantActionStates = append(s.state.InstantActionStates, as)
+	s.notify()
+}
+
+// BeginOrderCancellation rejects further updates while running actions stop.
+func (s *Store) BeginOrderCancellation() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancelled = true
+	for i := range s.state.ActionStates {
+		if s.state.ActionStates[i].ActionStatus == state.ActionStatusWaiting {
+			s.state.ActionStates[i].ActionStatus = state.ActionStatusFailed
+		}
+	}
 	s.notify()
 }
 
@@ -182,6 +210,9 @@ func (s *Store) CommitOrderProjection(p OrderProjection) {
 	defer s.mu.Unlock()
 
 	s.cancelled = false
+	if !p.KeepLastNode {
+		s.cleared = false
+	}
 	s.state.OrderID = p.OrderID
 	s.state.OrderUpdateID = p.OrderUpdateID
 	if p.KeepLastNode {
@@ -206,6 +237,14 @@ func (s *Store) CommitOrderProjection(p OrderProjection) {
 			edges = []state.EdgeState{}
 		}
 		p.EdgeStates = edges
+		for i := range p.ActionStates {
+			for _, previous := range s.state.ActionStates {
+				if p.ActionStates[i].ActionID == previous.ActionID {
+					p.ActionStates[i] = previous
+					break
+				}
+			}
+		}
 	} else {
 		s.state.LastNodeID = p.LastNodeID
 		s.state.LastNodeSequenceID = p.LastNodeSequenceID
@@ -230,6 +269,16 @@ func (s *Store) CommitOrderProjection(p OrderProjection) {
 // publish. Signals coalesce: at most one is pending.
 func (s *Store) Changes() <-chan struct{} {
 	return s.changes
+}
+
+// ReadinessChanges wakes the executor without consuming publisher notifications.
+func (s *Store) ReadinessChanges() <-chan struct{} { return s.readiness }
+
+func (s *Store) notifyReadiness() {
+	select {
+	case s.readiness <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Store) notify() {
@@ -299,16 +348,55 @@ func (s *Store) SetTelemetry(t Telemetry) {
 		defer s.notify()
 	}
 
+	previousPose, previousMode, previousSafety := s.state.MobileRobotPosition, s.state.OperatingMode, s.state.SafetyState
+	defer func() {
+		pose := s.state.MobileRobotPosition
+		if previousMode != s.state.OperatingMode || previousSafety != s.state.SafetyState || (previousPose == nil) != (pose == nil) ||
+			(previousPose != nil && pose != nil && (previousPose.Localized != pose.Localized || previousPose.MapID != pose.MapID)) {
+			s.notifyReadiness()
+		}
+	}()
+
 	if t.PowerSupply != nil {
 		s.state.PowerSupply = *t.PowerSupply
 	}
 	s.state.MobileRobotPosition = t.MobileRobotPosition
+	s.updateLocalizationError()
 	if t.SafetyState != nil {
 		s.state.SafetyState = *t.SafetyState
 	}
 	if t.OperatingMode != nil {
-		s.state.OperatingMode = *t.OperatingMode
+		wasIdle := IsIdle(s.state) && !s.state.Driving && s.actionsTerminal()
+		hadPending := s.pendingMode != ""
+		s.desiredMode = *t.OperatingMode
+		clearsOrder := *t.OperatingMode == state.OperatingModeManual || *t.OperatingMode == state.OperatingModeService ||
+			*t.OperatingMode == state.OperatingModeTeachIn || *t.OperatingMode == state.OperatingModeStartup
+		if clearsOrder && *t.OperatingMode != s.state.OperatingMode {
+			s.pendingMode = *t.OperatingMode
+			s.clearLastNode = s.clearLastNode || *t.OperatingMode == state.OperatingModeService || *t.OperatingMode == state.OperatingModeTeachIn || *t.OperatingMode == state.OperatingModeStartup
+			s.cleared = true
+			for i := range s.state.ActionStates {
+				if s.state.ActionStates[i].ActionStatus == state.ActionStatusWaiting {
+					s.state.ActionStates[i].ActionStatus = state.ActionStatusFailed
+				}
+			}
+			for i := range s.state.InstantActionStates {
+				if s.state.InstantActionStates[i].ActionStatus == state.ActionStatusWaiting {
+					s.state.InstantActionStates[i].ActionStatus = state.ActionStatusFailed
+				}
+			}
+			s.notifyReadiness()
+		}
+		if s.pendingMode == "" {
+			s.state.OperatingMode = *t.OperatingMode
+			if *t.OperatingMode == state.OperatingModeIntervened {
+				s.state.ZoneRequests = nil
+			}
+		} else if !hadPending && wasIdle {
+			s.completeModeTransition()
+		}
 	}
+	s.clearAvailabilityError()
 	if t.Driving != nil {
 		s.state.Driving = *t.Driving
 	}
@@ -317,6 +405,19 @@ func (s *Store) SetTelemetry(t Telemetry) {
 	s.state.DistanceSinceLastNode = t.DistanceSinceLastNode
 	s.state.Information = t.Information
 	s.state.PlannedPath = t.PlannedPath
+}
+
+// Caller holds the state lock. Pending clearing modes still reject new orders.
+func (s *Store) clearAvailabilityError() {
+	if s.pendingMode != "" || (s.state.OperatingMode != state.OperatingModeAutomatic && s.state.OperatingMode != state.OperatingModeSemiAutomatic && s.state.OperatingMode != state.OperatingModeIntervened) {
+		return
+	}
+	for i := len(s.state.Errors) - 1; i >= 0; i-- {
+		if s.state.Errors[i].ErrorType == state.ErrorTypeMobileRobotNotAvailable {
+			s.state.Errors = append(s.state.Errors[:i:i], s.state.Errors[i+1:]...)
+			s.notify()
+		}
+	}
 }
 
 var orderScopedErrorTypes = map[state.ErrorType]struct{}{
@@ -333,4 +434,107 @@ var orderScopedErrorTypes = map[state.ErrorType]struct{}{
 	state.ErrorTypeNoOrderToCancel:            {},
 	state.ErrorTypeInsufficientMemory:         {},
 	state.ErrorTypeNodeUnreachable:            {},
+}
+
+// RequestedOperatingMode includes a latched clear even if telemetry already returned to AUTO.
+func (s *Store) RequestedOperatingMode() state.OperatingMode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingMode != "" {
+		return s.pendingMode
+	}
+	return s.desiredMode
+}
+
+func (s *Store) ModeChangePending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingMode != ""
+}
+
+func (s *Store) OrderCleared() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cleared
+}
+
+// CompleteModeTransition is called only after the executor has no operation awaiting completion.
+func (s *Store) CompleteModeTransition() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingMode != "" && s.actionsTerminal() {
+		s.completeModeTransition()
+	}
+}
+
+func (s *Store) actionsTerminal() bool {
+	for _, actions := range [][]state.ActionState{s.state.ActionStates, s.state.InstantActionStates} {
+		for _, action := range actions {
+			if action.ActionStatus != state.ActionStatusFinished && action.ActionStatus != state.ActionStatusFailed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Store) completeModeTransition() {
+	if s.clearLastNode {
+		s.state.LastNodeID = ""
+	}
+	s.state.NodeStates = []state.NodeState{}
+	s.state.EdgeStates = []state.EdgeState{}
+	s.state.ZoneRequests = nil
+	s.state.EdgeRequests = nil
+	s.state.OperatingMode = s.desiredMode
+	s.pendingMode = ""
+	s.clearLastNode = false
+	s.clearAvailabilityError()
+	s.notifyReadiness()
+	s.notify()
+}
+
+// Caller holds the state lock; unknown startup pose is not a reported failure.
+func (s *Store) updateLocalizationError() {
+	pose := s.state.MobileRobotPosition
+	if pose == nil {
+		return
+	}
+	for i, err := range s.state.Errors {
+		if err.ErrorType != state.ErrorTypeLocalizationError {
+			continue
+		}
+		if pose.Localized {
+			s.state.Errors = append(s.state.Errors[:i:i], s.state.Errors[i+1:]...)
+			s.notify()
+		}
+		return
+	}
+	if !pose.Localized {
+		s.state.Errors = append(s.state.Errors, state.Error{
+			ErrorType:        state.ErrorTypeLocalizationError,
+			ErrorLevel:       state.ErrorLevelFatal,
+			ErrorDescription: "robot is not localized",
+		})
+		s.notify()
+	}
+}
+
+// CompleteRelocalization publishes the confirmed pose and action outcome together.
+func (s *Store) CompleteRelocalization(actionID string, pose state.MobileRobotPosition, lastNodeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.InstantActionStates {
+		if s.state.InstantActionStates[i].ActionID == actionID {
+			s.state.MobileRobotPosition = &pose
+			s.updateLocalizationError()
+			s.state.LastNodeID = lastNodeID
+			s.state.LastNodeSequenceID = 0
+			s.state.InstantActionStates[i].ActionStatus = state.ActionStatusFinished
+			s.state.InstantActionStates[i].ActionResult = ""
+			s.notifyReadiness()
+			s.notify()
+			return
+		}
+	}
 }

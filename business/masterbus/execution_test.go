@@ -251,7 +251,7 @@ func (f *e2eCommander) Events() (<-chan robotbus.ExecutionEvent, error) {
 func TestOrderExecutionEndToEnd(t *testing.T) {
 	st := &syncTransport{}
 	store := vehiclestate.New()
-	bus, err := NewWithTransport(st, store, "sn-1", "3.0.0", "lionsbot")
+	bus, err := NewWithTransport(st, store, "TESTBOT", "3.0.0", "lionsbot")
 	if err != nil {
 		t.Fatalf("NewWithTransport: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestOrderExecutionEndToEnd(t *testing.T) {
 func TestChangePublisher_PublishesOnStoreChange(t *testing.T) {
 	st := &syncTransport{}
 	store := vehiclestate.New()
-	bus, err := NewWithTransport(st, store, "sn-1", "3.0.0", "lionsbot")
+	bus, err := NewWithTransport(st, store, "TESTBOT", "3.0.0", "lionsbot")
 	if err != nil {
 		t.Fatalf("NewWithTransport: %v", err)
 	}
@@ -331,7 +331,8 @@ func TestChangePublisher_PublishesOnStoreChange(t *testing.T) {
 func TestInstantActionExecutionEndToEnd(t *testing.T) {
 	st := &syncTransport{}
 	store := vehiclestate.New()
-	bus, err := NewWithTransport(st, store, "sn-1", "3.0.0", "lionsbot")
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
+	bus, err := NewWithTransport(st, store, "TESTBOT", "3.0.0", "lionsbot")
 	if err != nil {
 		t.Fatalf("NewWithTransport: %v", err)
 	}
@@ -348,7 +349,7 @@ func TestInstantActionExecutionEndToEnd(t *testing.T) {
 	go func() { _ = exec.Start(ctx) }()
 	go bus.StartChangePublisher(ctx)
 
-	bus.handleInstantActions([]byte(`{"headerId":1,"timestamp":"2026-07-17T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"sn-1","actions":[{"actionId":"ia-e2e","actionType":"startCharging","blockingType":"NONE"}]}`))
+	bus.handleInstantActions([]byte(`{"headerId":1,"timestamp":"2026-07-17T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"TESTBOT","actions":[{"actionId":"ia-e2e","actionType":"startCharging","blockingType":"NONE"}]}`))
 
 	select {
 	case <-cmd.chargeStarts:
@@ -373,7 +374,8 @@ func TestInstantActionExecutionEndToEnd(t *testing.T) {
 func TestCleaningExecutionEndToEnd(t *testing.T) {
 	st := &syncTransport{}
 	store := vehiclestate.New()
-	bus, err := NewWithTransport(st, store, "sn-1", "3.0.0", "lionsbot")
+	store.SetTelemetry(vehiclestate.Telemetry{MobileRobotPosition: &state.MobileRobotPosition{Localized: true, MapID: "map-1"}})
+	bus, err := NewWithTransport(st, store, "TESTBOT", "3.0.0", "lionsbot")
 	if err != nil {
 		t.Fatalf("NewWithTransport: %v", err)
 	}
@@ -441,7 +443,7 @@ func TestCleaningExecutionEndToEnd(t *testing.T) {
 func TestCancelOrderRecoversFromFailedOrder(t *testing.T) {
 	st := &syncTransport{}
 	store := vehiclestate.New()
-	bus, err := NewWithTransport(st, store, "sn-1", "3.0.0", "lionsbot")
+	bus, err := NewWithTransport(st, store, "TESTBOT", "3.0.0", "lionsbot")
 	if err != nil {
 		t.Fatalf("NewWithTransport: %v", err)
 	}
@@ -498,7 +500,7 @@ func TestCancelOrderRecoversFromFailedOrder(t *testing.T) {
 	}
 
 	// the exit: cancelOrder clears it
-	bus.handleInstantActions([]byte(`{"headerId":9,"timestamp":"2026-07-17T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"sn-1","actions":[{"actionId":"c-e2e","actionType":"cancelOrder","blockingType":"NONE"}]}`))
+	bus.handleInstantActions([]byte(`{"headerId":9,"timestamp":"2026-07-17T00:00:00.000Z","version":"3.0.0","manufacturer":"lionsbot","serialNumber":"TESTBOT","actions":[{"actionId":"c-e2e","actionType":"cancelOrder","blockingType":"NONE"}]}`))
 
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
